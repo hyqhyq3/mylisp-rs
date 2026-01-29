@@ -91,6 +91,13 @@ impl From<MyLispError> for String {
     }
 }
 
+/// 向后兼容：将 String 转换为 MyLispError
+impl From<String> for MyLispError {
+    fn from(err: String) -> Self {
+        MyLispError::RuntimeError(err)
+    }
+}
+
 /// 转换 Result<Expr, MyLispError> 为 Result<Expr, String>
 pub fn into_string_result<T>(result: Result<T, MyLispError>) -> Result<T, String> {
     result.map_err(|e| e.to_string())

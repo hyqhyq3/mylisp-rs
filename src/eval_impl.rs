@@ -102,17 +102,26 @@ impl Evaluator {
                     let first = &list[0];
                     match first {
                         Expr::Symbol(op) => match op.as_str() {
-                            "define" => Self::eval_define(&list[1..], env),
+                            // 基础特殊形式 - 使用新的 SpecialForms 模块
+                            "define" => Self::eval_define_wrapper(&list[1..], env),
+                            "set!" => Self::eval_set_wrapper(&list[1..], env),
+                            "if" => Self::eval_if_wrapper(&list[1..], env, is_tail),
+                            "quote" => Self::eval_quote_wrapper(&list[1..]),
+
+                            // 复杂特殊形式 - 使用新的 SpecialForms 模块
+                            "lambda" | "fn" => Self::eval_lambda_wrapper(&list[1..]),
+                            "let" => Self::eval_let_wrapper(&list[1..], env, is_tail),
+                            "cond" => Self::eval_cond_wrapper(&list[1..], env, is_tail),
+                            "begin" => Self::eval_begin_wrapper(&list[1..], env, is_tail),
+
+                            // I/O 特殊形式 - 使用新的 SpecialForms 模块
+                            "eval" => Self::eval_eval_wrapper(&list[1..], env),
+                            "load" => Self::eval_load_wrapper(&list[1..], env),
+
+                            // 宏系统 - 保留在原处（后续拆分）
                             "define-syntax" => Self::eval_define_syntax(&list[1..], env),
-                            "set!" => Self::eval_set(&list[1..], env),
-                            "if" => Self::eval_if(&list[1..], env, is_tail),
-                            "cond" => Self::eval_cond(&list[1..], env, is_tail),
-                            "begin" => Self::eval_begin(&list[1..], env, is_tail),
-                            "lambda" | "fn" => Self::eval_lambda(&list[1..], env),
-                            "let" => Self::eval_let(&list[1..], env, is_tail),
-                            "quote" => Self::eval_quote(&list[1..]),
-                            "eval" => Self::eval_eval(&list[1..], env),
-                            "load" => Self::eval_load(&list[1..], env),
+
+                            // 函数调用
                             _ => Self::eval_function_call(list, env, is_tail),
                         },
                         _ => Self::eval_function_call(list, env, is_tail),
@@ -120,6 +129,75 @@ impl Evaluator {
                 }
             }
         }
+    }
+
+    // ========== SpecialForms 包装函数 ==========
+    // 这些函数将 Evaluator::eval 转换为符合 SpecialForms API 的闭包
+
+    fn eval_define_wrapper(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_define(args, env, |expr, env| {
+            Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_set_wrapper(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_set(args, env, |expr, env| {
+            Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_if_wrapper(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_if(args, env, |expr, env, is_tail| {
+            Self::eval_with_tail_context(expr, env, is_tail).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        }, is_tail)
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_quote_wrapper(args: &[Expr]) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_quote(args)
+            .map_err(|e| e.to_string())
+    }
+
+    fn eval_lambda_wrapper(args: &[Expr]) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_lambda(args)
+            .map_err(|e| e.to_string())
+    }
+
+    fn eval_let_wrapper(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_let(args, env, |expr, env, is_tail| {
+            Self::eval_with_tail_context(expr, env, is_tail).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        }, is_tail)
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_cond_wrapper(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_cond(args, env, |expr, env, is_tail| {
+            Self::eval_with_tail_context(expr, env, is_tail).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        }, is_tail)
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_begin_wrapper(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_begin(args, env, |expr, env, is_tail| {
+            Self::eval_with_tail_context(expr, env, is_tail).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        }, is_tail)
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_eval_wrapper(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_eval(args, env, |expr, env| {
+            Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn eval_load_wrapper(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_load(args, env, |expr, env| {
+            Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
+        })
+        .map_err(|e| e.to_string())
     }
 
     fn eval_define(args: &[Expr], env: &mut Env) -> Result<Expr, String> {

@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod builtins;
+pub mod special_forms;
 
 // 为了向后兼容，暂时导出 error 模块的内容
 pub use error::MyLispError;
