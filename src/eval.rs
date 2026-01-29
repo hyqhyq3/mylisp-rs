@@ -2,8 +2,41 @@ use crate::ast::Expr;
 use crate::env::Env;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub struct Evaluator;
+
+// 尾调用上下文:用于尾递归优化
+enum TailContext {
+    // 非尾位置
+    NonTail,
+    // 尾位置:需要优化的尾调用
+    Tail {
+        func: Expr,
+        args: Vec<Expr>,
+        env: Env,
+    },
+}
+
+// 宏定义:使用 syntax-rules
+#[derive(Debug, Clone)]
+struct Macro {
+    name: String,
+    rules: Vec<MacroRule>,
+}
+
+#[derive(Debug, Clone)]
+struct MacroRule {
+    pattern: Expr,     // 模式模式
+    template: Expr,    // 输出模板
+    literals: Vec<String>,  // 字面量标识符
+}
+
+// 宏转换器:用于模式匹配和模板展开
+struct MacroTransformer {
+    literals: Vec<String>,
+    pattern_vars: HashMap<String, Expr>,
+}
 
 // 用户定义的函数类型
 type UserFunction = Rc<RefCell<dyn FnMut(Vec<Expr>, &mut Env) -> Result<Expr, String>>>;
@@ -12,6 +45,10 @@ type UserFunction = Rc<RefCell<dyn FnMut(Vec<Expr>, &mut Env) -> Result<Expr, St
 thread_local! {
     static USER_FUNCTIONS: RefCell<std::collections::HashMap<String, UserFunction>> =
         RefCell::new(std::collections::HashMap::new());
+
+    // 全局宏注册表
+    static MACROS: RefCell<HashMap<String, Macro>> =
+        RefCell::new(HashMap::new());
 }
 
 pub fn register_user_function(name: String, func: UserFunction) {
@@ -29,8 +66,27 @@ pub fn call_user_function(name: &str, args: Vec<Expr>, env: &mut Env) -> Result<
     })
 }
 
+// 注册宏
+fn register_macro(name: String, macro_def: Macro) {
+    MACROS.with(|m| m.borrow_mut().insert(name, macro_def));
+}
+
+// 查找宏
+fn lookup_macro(name: &str) -> Option<Macro> {
+    MACROS.with(|m| m.borrow().get(name).cloned())
+}
+
 impl Evaluator {
+    // 主求值函数:支持尾调用优化
     pub fn eval(expr: Expr, env: &mut Env) -> Result<Expr, String> {
+        Self::eval_with_tail_context(expr, env, false)
+    }
+
+    // 带尾调用上下文的求值函数
+    fn eval_with_tail_context(expr: Expr, env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        // 首先展开宏
+        let expr = Self::expand_macros(expr)?;
+
         match expr {
             Expr::Number(_) | Expr::Bool(_) | Expr::Nil | Expr::String(_) => Ok(expr),
 
@@ -46,16 +102,17 @@ impl Evaluator {
                     match first {
                         Expr::Symbol(op) => match op.as_str() {
                             "define" => Self::eval_define(&list[1..], env),
+                            "define-syntax" => Self::eval_define_syntax(&list[1..], env),
                             "set!" => Self::eval_set(&list[1..], env),
-                            "if" => Self::eval_if(&list[1..], env),
+                            "if" => Self::eval_if(&list[1..], env, is_tail),
                             "lambda" | "fn" => Self::eval_lambda(&list[1..], env),
-                            "let" => Self::eval_let(&list[1..], env),
+                            "let" => Self::eval_let(&list[1..], env, is_tail),
                             "quote" => Self::eval_quote(&list[1..]),
                             "eval" => Self::eval_eval(&list[1..], env),
                             "load" => Self::eval_load(&list[1..], env),
-                            _ => Self::eval_function_call(list, env),
+                            _ => Self::eval_function_call(list, env, is_tail),
                         },
-                        _ => Self::eval_function_call(list, env),
+                        _ => Self::eval_function_call(list, env, is_tail),
                     }
                 }
             }
@@ -110,12 +167,12 @@ impl Evaluator {
         }
     }
 
-    fn eval_if(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+    fn eval_if(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
         if args.len() < 2 || args.len() > 3 {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
-        let condition = Self::eval(args[0].clone(), env)?;
+        let condition = Self::eval_with_tail_context(args[0].clone(), env, false)?;
         let is_true = match condition {
             Expr::Bool(b) => b,
             Expr::Nil => false,
@@ -123,9 +180,9 @@ impl Evaluator {
         };
 
         if is_true {
-            Self::eval(args[1].clone(), env)
+            Self::eval_with_tail_context(args[1].clone(), env, is_tail)
         } else if args.len() == 3 {
-            Self::eval(args[2].clone(), env)
+            Self::eval_with_tail_context(args[2].clone(), env, is_tail)
         } else {
             Ok(Expr::Nil)
         }
@@ -151,7 +208,7 @@ impl Evaluator {
         }
     }
 
-    fn eval_let(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+    fn eval_let(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
         if args.len() < 2 {
             return Err("let requires at least 2 arguments".to_string());
         }
@@ -165,7 +222,7 @@ impl Evaluator {
                         Expr::List(pair) if pair.len() == 2 => {
                             match &pair[0] {
                                 Expr::Symbol(name) => {
-                                    let value = Self::eval(pair[1].clone(), env)?;
+                                    let value = Self::eval_with_tail_context(pair[1].clone(), env, false)?;
                                     let_env.define(name.clone(), value);
                                 }
                                 _ => {
@@ -177,11 +234,18 @@ impl Evaluator {
                     }
                 }
 
-                let mut result = Ok(Expr::Nil);
-                for expr in &args[1..] {
-                    result = Self::eval(expr.clone(), &mut let_env);
+                // 只有一个表达式时,它是尾位置
+                if args.len() == 2 {
+                    Self::eval_with_tail_context(args[1].clone(), &mut let_env, is_tail)
+                } else {
+                    // 多个表达式时,只有最后一个是尾位置
+                    let mut result = Ok(Expr::Nil);
+                    for (i, expr) in args[1..].iter().enumerate() {
+                        let is_last = i == args.len() - 2;
+                        result = Self::eval_with_tail_context(expr.clone(), &mut let_env, is_tail && is_last);
+                    }
+                    result
                 }
-                result
             }
             _ => Err("let: first argument must be a list of bindings".to_string()),
         }
@@ -232,13 +296,13 @@ impl Evaluator {
         }
     }
 
-    fn eval_function_call(args: Vec<Expr>, env: &mut Env) -> Result<Expr, String> {
+    fn eval_function_call(args: Vec<Expr>, env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        // 先求值操作数(不求值操作符)
         let evaluated_args: Result<Vec<Expr>, String> =
-            args.iter().skip(1).map(|a| Self::eval(a.clone(), env)).collect();
-
+            args.iter().skip(1).map(|a| Self::eval_with_tail_context(a.clone(), env, false)).collect();
         let evaluated_args = evaluated_args?;
 
-        // Handle built-in operations
+        // 检查操作符是否是内置函数(符号)
         match &args[0] {
             Expr::Symbol(op) => match op.as_str() {
                 "+" => Self::apply_add(&evaluated_args),
@@ -267,14 +331,152 @@ impl Evaluator {
                 "display" => Self::apply_display(&evaluated_args),
                 "newline" => Self::apply_newline(),
                 _ => {
-                    let func = Self::eval(args[0].clone(), env)?;
+                    // 不是内置函数,求值操作符并调用
+                    let func = Self::eval_with_tail_context(args[0].clone(), env, false)?;
+                    if is_tail {
+                        if let Expr::List(ref list) = func {
+                            if !list.is_empty()
+                                && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
+                            {
+                                // 尾调用优化
+                                return Self::apply_user_function_tail(func, evaluated_args, env);
+                            }
+                        }
+                    }
                     Self::apply_user_function(func, evaluated_args, env)
                 }
             },
             _ => {
-                let func = Self::eval(args[0].clone(), env)?;
+                // 操作符不是符号,求值并调用
+                let func = Self::eval_with_tail_context(args[0].clone(), env, false)?;
+                if is_tail {
+                    if let Expr::List(ref list) = func {
+                        if !list.is_empty()
+                            && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
+                        {
+                            return Self::apply_user_function_tail(func, evaluated_args, env);
+                        }
+                    }
+                }
                 Self::apply_user_function(func, evaluated_args, env)
             }
+        }
+    }
+
+    // 尾调用优化版本的函数应用:使用循环代替递归
+    fn apply_user_function_tail(func: Expr, args: Vec<Expr>, env: &mut Env) -> Result<Expr, String> {
+        let mut current_func = func;
+        let mut current_args = args;
+        let mut current_env = env.clone();
+
+        loop {
+            // 提取 lambda 信息
+            let (params, body_exprs) = match &current_func {
+                Expr::List(list) if !list.is_empty() => {
+                    match &list[0] {
+                        Expr::Symbol(s) if s == "lambda" || s == "fn" => {
+                            match &list[1] {
+                                Expr::List(params) => (params.clone(), list[2..].to_vec()),
+                                _ => return Err("Invalid lambda parameter list".to_string()),
+                            }
+                        }
+                        _ => return Err("Cannot call non-function".to_string()),
+                    }
+                }
+                _ => return Err("Cannot call non-function".to_string()),
+            };
+
+            // 检查参数数量
+            if params.len() != current_args.len() {
+                return Err(format!(
+                    "Arity mismatch: expected {}, got {}",
+                    params.len(),
+                    current_args.len()
+                ));
+            }
+
+            // 创建新环境
+            let mut func_env = Env::with_parent(current_env);
+
+            // 绑定参数
+            for (param, arg) in params.iter().zip(current_args.iter()) {
+                match param {
+                    Expr::Symbol(name) => {
+                        func_env.define(name.clone(), arg.clone());
+                    }
+                    _ => {}
+                }
+            }
+
+            // 按顺序求值 body
+            let mut result = Ok(Expr::Nil);
+            let mut next_tail_call = None;
+
+            for (i, expr) in body_exprs.iter().enumerate() {
+                let is_last = i == body_exprs.len() - 1;
+
+                if is_last {
+                    // 最后一个表达式:检查是否是尾调用
+                    match expr {
+                        Expr::List(call_list) if !call_list.is_empty() => {
+                            // 求值操作符
+                            let func = Self::eval_with_tail_context(
+                                call_list[0].clone(),
+                                &mut func_env,
+                                false
+                            )?;
+
+                            // 求值参数
+                            let evaluated_args: Result<Vec<Expr>, String> = call_list[1..]
+                                .iter()
+                                .map(|a| Self::eval_with_tail_context(a.clone(), &mut func_env, false))
+                                .collect();
+                            let evaluated_args = evaluated_args?;
+
+                            // 检查是否是尾调用 lambda
+                            match func {
+                                Expr::List(ref inner_list) if !inner_list.is_empty() => {
+                                    match &inner_list[0] {
+                                        Expr::Symbol(s) if s == "lambda" || s == "fn" => {
+                                            // 尾调用:保存信息并继续循环
+                                            next_tail_call = Some((func, evaluated_args, func_env));
+                                            break;
+                                        }
+                                        _ => {
+                                            // 不是 lambda,正常求值并返回
+                                            result = Self::apply_user_function(func, evaluated_args, &mut func_env);
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // 不是列表,正常求值并返回
+                                    result = Self::apply_user_function(func, evaluated_args, &mut func_env);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            // 最后一个表达式不是函数调用
+                            result = Self::eval_with_tail_context(expr.clone(), &mut func_env, true);
+                        }
+                    }
+                } else {
+                    // 不是最后一个表达式
+                    result = Self::eval_with_tail_context(expr.clone(), &mut func_env, false);
+                }
+            }
+
+            // 如果有尾调用,继续循环
+            if let Some((func, args, new_env)) = next_tail_call {
+                current_func = func;
+                current_args = args;
+                current_env = new_env;
+                continue;
+            }
+
+            // 没有尾调用,返回结果
+            return result;
         }
     }
 
@@ -611,5 +813,214 @@ impl Evaluator {
     fn apply_newline() -> Result<Expr, String> {
         println!();
         Ok(Expr::Nil)
+    }
+
+    // ========== 宏系统实现 ==========
+
+    // 定义宏: (define-syntax name (syntax-rules (literal ...) (pattern template) ...))
+    fn eval_define_syntax(args: &[Expr], _env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("define-syntax requires exactly 2 arguments".to_string());
+        }
+
+        let name = match &args[0] {
+            Expr::Symbol(s) => s.clone(),
+            _ => return Err("define-syntax: name must be a symbol".to_string()),
+        };
+
+        let syntax_rules = match &args[1] {
+            Expr::List(list) if !list.is_empty() => {
+                match &list[0] {
+                    Expr::Symbol(s) if s == "syntax-rules" => &list[1..],
+                    _ => return Err("define-syntax: must use syntax-rules".to_string()),
+                }
+            }
+            _ => return Err("define-syntax: second argument must be a list".to_string()),
+        };
+
+        if syntax_rules.is_empty() {
+            return Err("syntax-rules requires at least literals and one rule".to_string());
+        }
+
+        // 提取字面量
+        let literals: Vec<String> = match &syntax_rules[0] {
+            Expr::List(lits) => {
+                lits.iter().filter_map(|e| {
+                    if let Expr::Symbol(s) = e { Some(s.clone()) } else { None }
+                }).collect()
+            }
+            _ => return Err("syntax-rules: literals must be a list of symbols".to_string()),
+        };
+
+        // 提取规则
+        let mut rules = Vec::new();
+        for rule in &syntax_rules[1..] {
+            match rule {
+                Expr::List(r) if r.len() == 2 => {
+                    rules.push(MacroRule {
+                        pattern: r[0].clone(),
+                        template: r[1].clone(),
+                        literals: literals.clone(),
+                    });
+                }
+                _ => return Err("syntax-rules: each rule must be (pattern template)".to_string()),
+            }
+        }
+
+        register_macro(name.clone(), Macro { name: name.clone(), rules });
+        Ok(Expr::Nil)
+    }
+
+    // 宏展开:递归展开所有宏
+    fn expand_macros(expr: Expr) -> Result<Expr, String> {
+        match expr {
+            Expr::List(list) if !list.is_empty() => {
+                // 检查是否是宏调用
+                match &list[0] {
+                    Expr::Symbol(sym) => {
+                        if let Some(macro_def) = lookup_macro(sym) {
+                            // 展开宏
+                            let expanded = Self::apply_macro(&macro_def, &list)?;
+                            // 递归展开结果
+                            return Self::expand_macros(expanded);
+                        }
+                    }
+                    _ => {}
+                }
+
+                // 递归展开列表元素
+                let expanded: Result<Vec<Expr>, String> = list
+                    .into_iter()
+                    .map(|e| Self::expand_macros(e))
+                    .collect();
+                Ok(Expr::List(expanded?))
+            }
+            _ => Ok(expr),
+        }
+    }
+
+    // 应用宏:模式匹配和模板展开
+    fn apply_macro(macro_def: &Macro, args: &[Expr]) -> Result<Expr, String> {
+        for rule in &macro_def.rules {
+            if let Some(binding) = Self::match_pattern(&rule.pattern, args, &rule.literals) {
+                return Self::expand_template(&rule.template, &binding);
+            }
+        }
+        Err(format!("Macro '{}' pattern match failed", macro_def.name))
+    }
+
+    // 模式匹配:返回模式变量绑定
+    fn match_pattern(
+        pattern: &Expr,
+        expr: &[Expr],
+        literals: &[String]
+    ) -> Option<HashMap<String, Expr>> {
+        if expr.is_empty() {
+            return None;
+        }
+
+        // 检查操作符是否匹配
+        let pattern_list = match pattern {
+            Expr::List(l) => l.as_slice(),
+            _ => return None,
+        };
+
+        if pattern_list.is_empty() {
+            return None;
+        }
+
+        let pattern_op = match &pattern_list[0] {
+            Expr::Symbol(s) => s.clone(),
+            _ => return None,
+        };
+
+        let expr_op = match &expr[0] {
+            Expr::Symbol(s) => s.clone(),
+            _ => return None,
+        };
+
+        if pattern_op != expr_op {
+            return None;
+        }
+
+        let mut bindings = HashMap::new();
+
+        // 匹配参数
+        if pattern_list.len() - 1 != expr.len() - 1 {
+            return None;
+        }
+
+        for (pattern_arg, expr_arg) in pattern_list[1..].iter().zip(expr[1..].iter()) {
+            if !Self::match_pattern_single(pattern_arg, expr_arg, literals, &mut bindings) {
+                return None;
+            }
+        }
+
+        Some(bindings)
+    }
+
+    // 单个模式元素匹配
+    fn match_pattern_single(
+        pattern: &Expr,
+        expr: &Expr,
+        literals: &[String],
+        bindings: &mut HashMap<String, Expr>
+    ) -> bool {
+        match pattern {
+            Expr::Symbol(sym) => {
+                // 检查是否是字面量
+                if literals.contains(sym) {
+                    match expr {
+                        Expr::Symbol(s) if s == sym => true,
+                        _ => false,
+                    }
+                } else if sym == "..." {
+                    // 省略号标识符(未实现)
+                    true
+                } else {
+                    // 模式变量
+                    bindings.insert(sym.clone(), expr.clone());
+                    true
+                }
+            }
+            Expr::List(pattern_list) => {
+                match expr {
+                    Expr::List(expr_list) => {
+                        if pattern_list.len() != expr_list.len() {
+                            return false;
+                        }
+                        for (p, e) in pattern_list.iter().zip(expr_list.iter()) {
+                            if !Self::match_pattern_single(p, e, literals, bindings) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => pattern == expr,
+        }
+    }
+
+    // 模板展开
+    fn expand_template(template: &Expr, bindings: &HashMap<String, Expr>) -> Result<Expr, String> {
+        match template {
+            Expr::Symbol(sym) => {
+                if let Some(value) = bindings.get(sym) {
+                    Ok(value.clone())
+                } else {
+                    Ok(Expr::Symbol(sym.clone()))
+                }
+            }
+            Expr::List(list) => {
+                let expanded: Result<Vec<Expr>, String> = list
+                    .iter()
+                    .map(|e| Self::expand_template(e, bindings))
+                    .collect();
+                Ok(Expr::List(expanded?))
+            }
+            _ => Ok(template.clone()),
+        }
     }
 }
