@@ -6,9 +6,13 @@
 pub mod error;
 pub mod builtins;
 pub mod special_forms;
+pub mod macros;
 
 // 为了向后兼容，暂时导出 error 模块的内容
 pub use error::MyLispError;
+
+// 导出宏系统类型和函数
+pub use macros::{Macro, MacroRule, PatternBinding, register_macro, lookup_macro};
 
 // 包含原始的 eval.rs 实现
 include!("../eval_impl.rs");
