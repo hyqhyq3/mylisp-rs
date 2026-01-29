@@ -1,16 +1,10 @@
-mod ast;
-mod env;
-mod eval;
-mod lexer;
-mod parser;
-
+// 导入库模块
+use mylisp::ast::Expr;
+use mylisp::env::Env;
+use mylisp::eval::Evaluator;
+use mylisp::lexer::Lexer;
+use mylisp::parser::Parser;
 use std::io::{self, Write};
-
-use ast::Expr;
-use env::Env;
-use eval::Evaluator;
-use lexer::Lexer;
-use parser::Parser;
 
 fn print_prompt(prompt: &str) {
     print!("{}", prompt);
@@ -93,9 +87,6 @@ fn main() {
 }
 
 fn eval_program(input: &str, env: &mut Env) -> Result<(), String> {
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
-
     let lexer = Lexer::new(input);
     let mut parser = Parser::new(lexer);
 
