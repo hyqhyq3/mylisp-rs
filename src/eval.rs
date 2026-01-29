@@ -105,6 +105,8 @@ impl Evaluator {
                             "define-syntax" => Self::eval_define_syntax(&list[1..], env),
                             "set!" => Self::eval_set(&list[1..], env),
                             "if" => Self::eval_if(&list[1..], env, is_tail),
+                            "cond" => Self::eval_cond(&list[1..], env, is_tail),
+                            "begin" => Self::eval_begin(&list[1..], env, is_tail),
                             "lambda" | "fn" => Self::eval_lambda(&list[1..], env),
                             "let" => Self::eval_let(&list[1..], env, is_tail),
                             "quote" => Self::eval_quote(&list[1..]),
@@ -186,6 +188,76 @@ impl Evaluator {
         } else {
             Ok(Expr::Nil)
         }
+    }
+
+    fn eval_cond(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        if args.is_empty() {
+            return Err("cond requires at least one clause".to_string());
+        }
+
+        for clause in args {
+            match clause {
+                Expr::List(clause_list) if !clause_list.is_empty() => {
+                    let test = &clause_list[0];
+
+                    // 检查是否是 else 子句
+                    let is_else = match test {
+                        Expr::Symbol(s) if s == "else" => true,
+                        _ => false,
+                    };
+
+                    // 求值测试条件
+                    let test_result = if is_else {
+                        Ok(Expr::Bool(true))
+                    } else {
+                        Self::eval_with_tail_context(test.clone(), env, false)
+                    }?;
+
+                    let is_true = match test_result {
+                        Expr::Bool(b) => b,
+                        Expr::Nil => false,
+                        _ => true,
+                    };
+
+                    if is_true {
+                        // 执行该子句的主体
+                        if clause_list.len() == 1 {
+                            // 只有测试条件,没有主体,返回测试值
+                            return Ok(test_result);
+                        } else if clause_list.len() == 2 {
+                            // 单个表达式
+                            return Self::eval_with_tail_context(clause_list[1].clone(), env, is_tail);
+                        } else {
+                            // 多个表达式,用 begin 语义
+                            return Self::eval_begin(&clause_list[1..], env, is_tail);
+                        }
+                    }
+                }
+                Expr::Symbol(s) if s == "else" => {
+                    return Err("cond: else clause must be a list".to_string());
+                }
+                _ => return Err("cond: each clause must be a list".to_string()),
+            }
+        }
+
+        // 没有子句匹配,返回 nil
+        Ok(Expr::Nil)
+    }
+
+    fn eval_begin(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        if args.is_empty() {
+            return Ok(Expr::Nil);
+        }
+
+        let mut result = Ok(Expr::Nil);
+        let len = args.len();
+
+        for (i, expr) in args.iter().enumerate() {
+            let is_last = i == len - 1;
+            result = Self::eval_with_tail_context(expr.clone(), env, is_tail && is_last);
+        }
+
+        result
     }
 
     fn eval_lambda(args: &[Expr], _env: &mut Env) -> Result<Expr, String> {
@@ -309,6 +381,7 @@ impl Evaluator {
                 "-" => Self::apply_sub(&evaluated_args),
                 "*" => Self::apply_mul(&evaluated_args),
                 "/" => Self::apply_div(&evaluated_args),
+                "mod" => Self::apply_mod(&evaluated_args),
                 ">" => Self::apply_gt(&evaluated_args),
                 ">=" => Self::apply_ge(&evaluated_args),
                 "<" => Self::apply_lt(&evaluated_args),
@@ -328,6 +401,11 @@ impl Evaluator {
                 "list?" => Self::apply_list(&evaluated_args),
                 "number?" => Self::apply_number(&evaluated_args),
                 "string?" => Self::apply_string(&evaluated_args),
+                "map" => Self::apply_map(&evaluated_args, env),
+                "filter" => Self::apply_filter(&evaluated_args, env),
+                "fold" => Self::apply_fold(&evaluated_args, env),
+                "length" => Self::apply_length(&evaluated_args),
+                "reverse" => Self::apply_reverse(&evaluated_args),
                 "display" => Self::apply_display(&evaluated_args),
                 "newline" => Self::apply_newline(),
                 _ => {
@@ -596,6 +674,22 @@ impl Evaluator {
             .fold(first, |acc, x| acc / x);
 
         Ok(Expr::Number(result))
+    }
+
+    fn apply_mod(args: &[Expr]) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("mod requires exactly 2 arguments".to_string());
+        }
+
+        match (&args[0], &args[1]) {
+            (Expr::Number(a), Expr::Number(b)) => {
+                if *b == 0.0 {
+                    return Err("Division by zero".to_string());
+                }
+                Ok(Expr::Number(a % b))
+            }
+            _ => Err("mod expects numbers".to_string()),
+        }
     }
 
     fn apply_gt(args: &[Expr]) -> Result<Expr, String> {
@@ -1021,6 +1115,109 @@ impl Evaluator {
                 Ok(Expr::List(expanded?))
             }
             _ => Ok(template.clone()),
+        }
+    }
+
+    // ========== 高阶列表函数 ==========
+
+    fn apply_map(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("map requires exactly 2 arguments".to_string());
+        }
+
+        let func = &args[0];
+        let list = match &args[1] {
+            Expr::List(l) => l,
+            _ => return Err("map: second argument must be a list".to_string()),
+        };
+
+        let mut result = Vec::new();
+        for item in list {
+            let call = Expr::List(vec![func.clone(), item.clone()]);
+            let mapped = Self::eval_with_tail_context(call, env, false)?;
+            result.push(mapped);
+        }
+
+        Ok(Expr::List(result))
+    }
+
+    fn apply_filter(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("filter requires exactly 2 arguments".to_string());
+        }
+
+        let func = &args[0];
+        let list = match &args[1] {
+            Expr::List(l) => l,
+            _ => return Err("filter: second argument must be a list".to_string()),
+        };
+
+        let mut result = Vec::new();
+        for item in list {
+            let call = Expr::List(vec![func.clone(), item.clone()]);
+            let predicate_result = Self::eval_with_tail_context(call, env, false)?;
+
+            let keep = match predicate_result {
+                Expr::Bool(b) => b,
+                Expr::Nil => false,
+                _ => true,
+            };
+
+            if keep {
+                result.push(item.clone());
+            }
+        }
+
+        Ok(Expr::List(result))
+    }
+
+    fn apply_fold(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 3 {
+            return Err("fold requires exactly 3 arguments".to_string());
+        }
+
+        let func = &args[0];
+        let initial = &args[1];
+        let list = match &args[2] {
+            Expr::List(l) => l,
+            _ => return Err("fold: third argument must be a list".to_string()),
+        };
+
+        let mut acc = initial.clone();
+        for item in list {
+            let call = Expr::List(vec![func.clone(), acc, item.clone()]);
+            acc = Self::eval_with_tail_context(call, env, false)?;
+        }
+
+        Ok(acc)
+    }
+
+    fn apply_length(args: &[Expr]) -> Result<Expr, String> {
+        if args.len() != 1 {
+            return Err("length requires exactly 1 argument".to_string());
+        }
+
+        let len = match &args[0] {
+            Expr::List(l) => l.len() as f64,
+            Expr::Nil => 0.0,
+            _ => return Err("length: argument must be a list".to_string()),
+        };
+
+        Ok(Expr::Number(len))
+    }
+
+    fn apply_reverse(args: &[Expr]) -> Result<Expr, String> {
+        if args.len() != 1 {
+            return Err("reverse requires exactly 1 argument".to_string());
+        }
+
+        match &args[0] {
+            Expr::List(l) => {
+                let reversed: Vec<Expr> = l.iter().rev().cloned().collect();
+                Ok(Expr::List(reversed))
+            }
+            Expr::Nil => Ok(Expr::List(vec![])),
+            _ => Err("reverse: argument must be a list".to_string()),
         }
     }
 }
