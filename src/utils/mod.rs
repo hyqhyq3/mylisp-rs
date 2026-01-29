@@ -15,9 +15,10 @@ pub use validator::{
     expect_non_empty_list,
     expect_non_empty,
     is_valid_identifier,
+    get_type_name,  // 导出 get_type_name
 };
 
-// 从 type_checker 导出（避免重导出 get_type_name，它已在 validator 中定义）
+// 从 type_checker 导出
 pub use type_checker::{
     expect_number,
     expect_string,

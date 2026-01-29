@@ -4,6 +4,7 @@
 //! 当前这个模块包含了所有的求值逻辑，将会在后续的重构中拆分为多个子模块。
 
 pub mod error;
+pub mod builtins;
 
 // 为了向后兼容，暂时导出 error 模块的内容
 pub use error::MyLispError;

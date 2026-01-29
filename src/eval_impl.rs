@@ -378,37 +378,77 @@ impl Evaluator {
         // 检查操作符是否是内置函数(符号)
         match &args[0] {
             Expr::Symbol(op) => match op.as_str() {
-                "+" => Self::apply_add(&evaluated_args),
-                "-" => Self::apply_sub(&evaluated_args),
-                "*" => Self::apply_mul(&evaluated_args),
-                "/" => Self::apply_div(&evaluated_args),
-                "mod" => Self::apply_mod(&evaluated_args),
-                ">" => Self::apply_gt(&evaluated_args),
-                ">=" => Self::apply_ge(&evaluated_args),
-                "<" => Self::apply_lt(&evaluated_args),
-                "<=" => Self::apply_le(&evaluated_args),
-                "=" => Self::apply_eq(&evaluated_args),
-                "not" => Self::apply_not(&evaluated_args),
+                // 算术运算 - 使用新的 Builtins 模块
+                "+" => crate::eval::builtins::Builtins::apply_add(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "-" => crate::eval::builtins::Builtins::apply_sub(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "*" => crate::eval::builtins::Builtins::apply_mul(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "/" => crate::eval::builtins::Builtins::apply_div(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "mod" => crate::eval::builtins::Builtins::apply_mod(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+
+                // 比较运算 - 使用新的 Builtins 模块
+                ">" => crate::eval::builtins::Builtins::apply_gt(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                ">=" => crate::eval::builtins::Builtins::apply_ge(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "<" => crate::eval::builtins::Builtins::apply_lt(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "<=" => crate::eval::builtins::Builtins::apply_le(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "=" => crate::eval::builtins::Builtins::apply_eq(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+
+                // 逻辑运算 - and 和 or 需要保留在原处（依赖 eval）
+                "not" => crate::eval::builtins::Builtins::apply_not(&evaluated_args)
+                    .map_err(|e| e.to_string()),
                 "and" => Self::apply_and(&evaluated_args, env),
                 "or" => Self::apply_or(&evaluated_args, env),
-                "list" => Ok(Expr::List(evaluated_args)),
-                "head" | "car" => Self::apply_head(&evaluated_args),
-                "tail" | "cdr" => Self::apply_tail(&evaluated_args),
-                "cons" => Self::apply_cons(&evaluated_args),
-                "append" => Self::apply_append(&evaluated_args),
-                "eq?" => Self::apply_eq(&evaluated_args),
-                "null?" => Self::apply_null(&evaluated_args),
-                "symbol?" => Self::apply_symbol(&evaluated_args),
-                "list?" => Self::apply_list(&evaluated_args),
-                "number?" => Self::apply_number(&evaluated_args),
-                "string?" => Self::apply_string(&evaluated_args),
+
+                // 列表操作 - 使用新的 Builtins 模块
+                "list" => crate::eval::builtins::Builtins::apply_list(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "head" | "car" => crate::eval::builtins::Builtins::apply_head(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "tail" | "cdr" => crate::eval::builtins::Builtins::apply_tail(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "cons" => crate::eval::builtins::Builtins::apply_cons(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "append" => crate::eval::builtins::Builtins::apply_append(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "length" => crate::eval::builtins::Builtins::apply_length(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "reverse" => crate::eval::builtins::Builtins::apply_reverse(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+
+                // 谓词函数 - 使用新的 Builtins 模块
+                "eq?" => crate::eval::builtins::Builtins::apply_eq(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "null?" => crate::eval::builtins::Builtins::apply_null(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "symbol?" => crate::eval::builtins::Builtins::apply_symbol_predicate(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "list?" => crate::eval::builtins::Builtins::apply_list_predicate(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "number?" => crate::eval::builtins::Builtins::apply_number_predicate(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "string?" => crate::eval::builtins::Builtins::apply_string_predicate(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+
+                // 高阶函数 - 保留在原处（依赖 eval）
                 "map" => Self::apply_map(&evaluated_args, env),
                 "filter" => Self::apply_filter(&evaluated_args, env),
                 "fold" => Self::apply_fold(&evaluated_args, env),
-                "length" => Self::apply_length(&evaluated_args),
-                "reverse" => Self::apply_reverse(&evaluated_args),
-                "display" => Self::apply_display(&evaluated_args),
-                "newline" => Self::apply_newline(),
+
+                // I/O 操作 - 使用新的 Builtins 模块
+                "display" => crate::eval::builtins::Builtins::apply_display(&evaluated_args)
+                    .map_err(|e| e.to_string()),
+                "newline" => crate::eval::builtins::Builtins::apply_newline()
+                    .map_err(|e| e.to_string()),
+
                 _ => {
                     // 不是内置函数,求值操作符并调用
                     let func = Self::eval_with_tail_context(args[0].clone(), env, false)?;
