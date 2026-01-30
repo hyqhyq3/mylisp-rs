@@ -291,17 +291,26 @@ impl SpecialForms {
         let content = std::fs::read_to_string(&filename)
             .map_err(|e| MyLispError::runtime(format!("Failed to read file '{}': {}", filename, e)))?;
 
+        // 解析整个文件内容，支持跨行表达式
         let mut result = Ok(Expr::Nil);
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with(';') {
-                let lexer = Lexer::new(line);
-                let mut parser = Parser::new(lexer);
-                if let Ok(expr) = parser.parse() {
+        let lexer = Lexer::new(&content);
+        let mut parser = Parser::new(lexer);
+
+        loop {
+            match parser.parse() {
+                Ok(expr) => {
                     result = eval_fn(expr, env);
+                }
+                Err(e) => {
+                    // 如果是 EOF 错误，说明正常结束
+                    if e.contains("EOF") {
+                        break;
+                    }
+                    return Err(MyLispError::runtime(format!("Parse error in '{}': {}", filename, e)));
                 }
             }
         }
+
         result
     }
 

@@ -102,12 +102,20 @@ impl Thunk {
             }
         }
 
-        // 求值 body（最后一个表达式）- 保持尾位置语义
-        if let Some(last_expr) = body_exprs.last() {
-            return Self::eval_tail_position_expr(last_expr, env, base_env, eval_fn);
+        if body_exprs.is_empty() {
+            return Ok(Thunk::Done(Expr::Nil));
         }
 
-        Ok(Thunk::Done(Expr::Nil))
+        // 先求值非尾位置表达式，确保 define 等副作用生效
+        if body_exprs.len() > 1 {
+            for expr in &body_exprs[..body_exprs.len() - 1] {
+                Self::eval_simple_with_builtins(expr, env, base_env, eval_fn)?;
+            }
+        }
+
+        // 最后一个表达式保持尾位置语义
+        let last_expr = body_exprs.last().expect("body_exprs not empty");
+        Self::eval_tail_position_expr(last_expr, env, base_env, eval_fn)
     }
 
     /// 在尾位置求值 if 表达式
@@ -701,5 +709,37 @@ mod tests {
             eprintln!("Error in very deep recursion test: {}", e);
         }
         assert!(result.is_ok(), "Very deep recursion test failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_define_in_function_body_with_tco() {
+        // 确保函数体内 define 在 TCO 路径下生效
+        let mut env = Env::new();
+
+        let func = lambda(
+            vec![sym("x")],
+            vec![
+                list(vec![
+                    sym("define"),
+                    sym("y"),
+                    list(vec![sym("+"), sym("x"), num(1.0)]),
+                ]),
+                sym("y"),
+            ],
+        );
+
+        env.define("f".to_string(), func);
+
+        let thunk = Thunk::TailCall {
+            func: env.get("f").unwrap(),
+            args: vec![num(2.0)],
+            env_snapshot: env.clone(),
+        };
+
+        let result = thunk.trampoline(&mut env, |expr, env| {
+            Evaluator::eval(expr, env)
+        });
+
+        assert_eq!(result.unwrap(), num(3.0));
     }
 }
