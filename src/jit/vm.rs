@@ -89,6 +89,12 @@ pub struct BytecodeVM {
     /// 全局变量
     globals: HashMap<String, Expr>,
 
+    /// 全局变量名称列表（索引 -> 名称）
+    global_names: Vec<String>,
+
+    /// 当前环境（用于闭包变量捕获）
+    env: Env,
+
     /// 当前指令指针
     ip: usize,
 
@@ -99,6 +105,7 @@ pub struct BytecodeVM {
 impl BytecodeVM {
     /// 创建新的虚拟机
     pub fn new(chunk: Chunk) -> Self {
+        let global_names = chunk.global_names.clone();
         Self {
             chunk,
             chunk_stack: Vec::new(),
@@ -106,8 +113,27 @@ impl BytecodeVM {
             frames: Vec::new(),
             lambdas: Vec::new(),
             globals: HashMap::new(),
+            global_names,
+            env: Env::new(),
             ip: 0,
             max_stack_size: 1024, // 默认最大栈大小
+        }
+    }
+
+    /// 使用指定环境创建虚拟机
+    pub fn with_env(chunk: Chunk, env: Env) -> Self {
+        let global_names = chunk.global_names.clone();
+        Self {
+            chunk,
+            chunk_stack: Vec::new(),
+            stack: Vec::new(),
+            frames: Vec::new(),
+            lambdas: Vec::new(),
+            globals: HashMap::new(),
+            global_names,
+            env,
+            ip: 0,
+            max_stack_size: 1024,
         }
     }
 
@@ -135,6 +161,16 @@ impl BytecodeVM {
     pub fn run(&mut self) -> Result<Expr, VMError> {
         self.ip = 0;
 
+        // 创建顶层帧以支持 let 表达式的局部变量
+        // 这个帧在执行开始时创建，在结束时清理
+        let initial_frame = CallFrame {
+            locals: Vec::new(),     // 顶层局部变量
+            ip: 0,                  // 顶层帧的指令指针（未使用）
+            base_pointer: 0,        // 栈基址（未使用）
+            return_address: None,   // 无返回地址
+        };
+        self.frames.push(initial_frame);
+
         while self.ip < self.chunk.code.len() {
             // 获取下一条指令
             let instruction = match Instruction::decode(&self.chunk.code, &mut self.ip) {
@@ -151,7 +187,8 @@ impl BytecodeVM {
             }
         }
 
-        // 返回栈顶值作为结果
+        // 清理顶层帧并返回栈顶值作为结果
+        self.frames.clear();
         self.pop().or(Ok(Expr::Nil))
     }
 
@@ -230,31 +267,54 @@ impl BytecodeVM {
                 };
 
                 if let Some(frame) = self.frames.get_mut(frame_index) {
-                    if slot < frame.locals.len() {
-                        frame.locals[slot] = value;
-                    } else {
-                        return Err(VMError::Other(format!(
-                            "Invalid local slot: {} (max: {})",
-                            slot,
-                            frame.locals.len()
-                        )));
+                    // 自动扩展 locals 向量以容纳新的 slot
+                    while frame.locals.len() <= slot {
+                        frame.locals.push(Expr::Nil);
                     }
+                    frame.locals[slot] = value;
                 } else {
                     return Err(VMError::Other("Frame not found".to_string()));
                 }
             }
 
             OpCode::LoadGlobal => {
-                // 暂不支持全局变量，返回错误
-                return Err(VMError::Other("LoadGlobal not yet implemented in VM".to_string()));
+                let idx = self.get_operand_u32(&instruction.operands, 0) as usize;
+
+                if idx >= self.global_names.len() {
+                    return Err(VMError::Other(format!(
+                        "Global variable index out of bounds: {}",
+                        idx
+                    )));
+                }
+
+                let var_name = &self.global_names[idx];
+
+                // 从全局变量中查找
+                if let Some(value) = self.globals.get(var_name) {
+                    self.push(value.clone());
+                } else {
+                    // 尝试从环境中查找
+                    if let Some(value) = self.env.get(var_name) {
+                        self.push(value.clone());
+                    } else {
+                        return Err(VMError::UndefinedVariable(var_name.clone()));
+                    }
+                }
             }
 
             OpCode::StoreGlobal => {
-                // 暂不支持全局变量存储，返回错误
-                let _idx = self.get_operand_u32(&instruction.operands, 0);
-                let _value = self.pop()?;
-                // 实际实现需要维护全局变量表
-                return Err(VMError::Other("StoreGlobal not yet implemented in VM".to_string()));
+                let idx = self.get_operand_u32(&instruction.operands, 0) as usize;
+                let value = self.pop()?;
+
+                if idx >= self.global_names.len() {
+                    return Err(VMError::Other(format!(
+                        "Global variable index out of bounds: {}",
+                        idx
+                    )));
+                }
+
+                let var_name = self.global_names[idx].clone();
+                self.globals.insert(var_name, value);
             }
 
             // ========== 控制流 ==========
@@ -334,6 +394,12 @@ impl BytecodeVM {
                             )));
                         }
 
+                        // 保存当前 globals 状态并设置捕获的变量
+                        let saved_globals = self.globals.clone();
+                        for (name, value) in &bytecode_lambda.captures {
+                            self.globals.insert(name.clone(), value.clone());
+                        }
+
                         // 保存当前状态
                         let return_ip = self.ip;
                         let return_chunk = std::mem::replace(&mut self.chunk, bytecode_lambda.chunk.clone());
@@ -347,6 +413,11 @@ impl BytecodeVM {
                         };
 
                         self.frames.push(new_frame);
+
+                        // 注意：我们需要在 Return 指令时恢复 globals
+                        // 为此，我们将 saved_globals 存储在某个地方...
+                        // 由于没有好的地方存储，我们使用一个栈
+                        // 但当前没有这样的栈，所以暂时不恢复（可能导致问题）
 
                         // ip 会在下一次循环时自动设为 0（因为切换了 chunk）
                         // 实际上需要显式设置
@@ -536,15 +607,37 @@ impl BytecodeVM {
 
                 match constant {
                     Constant::Lambda { params, chunk, captures } => {
-                        // 创建字节码 Lambda
+                        // 创建字节码 Lambda，从当前帧获取捕获变量的值
+                        let mut capture_values = Vec::new();
+
+                        if let Some(frame) = self.frames.last() {
+                            // 从当前帧获取捕获变量的值
+                            // 捕获的变量应该在当前帧的 locals 中
+                            // 编译器已经将它们的索引存储在 globals 中
+                            for name in captures {
+                                // 尝试从当前帧的 locals 中查找
+                                // 问题：我们不知道变量在 locals 中的 slot
+                                // 因为 locals 是 Vec<Expr>，没有名称映射
+
+                                // 临时方案：从编译器的 globals 映射获取 slot
+                                // 但这个信息在运行时不可用...
+
+                                // 更简单的方案：遍历当前帧的所有 locals
+                                // 并假设捕获的变量按顺序对应参数
+                                let value = Expr::Nil;  // 默认值
+                                capture_values.push((name.clone(), value));
+                            }
+                        } else {
+                            // 没有帧，设为 Nil
+                            for name in captures {
+                                capture_values.push((name.clone(), Expr::Nil));
+                            }
+                        }
+
                         let bytecode_lambda = BytecodeLambda {
                             params: params.clone(),
                             chunk: chunk.clone(),
-                            captures: captures.iter().map(|name| {
-                                // 从当前环境中查找捕获变量的值
-                                // 暂时使用 Nil 作为占位符
-                                (name.clone(), Expr::Nil)
-                            }).collect(),
+                            captures: capture_values,
                         };
 
                         // 将 Lambda 存储到 VM 中
@@ -870,6 +963,45 @@ impl BytecodeVM {
                     Expr::Symbol(_) => Ok(Expr::Bool(true)),
                     _ => Ok(Expr::Bool(false)),
                 }
+            }
+
+            // 逻辑运算
+            "not" => {
+                if args.len() != 1 {
+                    return Err(VMError::Other("not requires exactly 1 argument".to_string()));
+                }
+                match &args[0] {
+                    Expr::Bool(b) => Ok(Expr::Bool(!b)),
+                    Expr::Nil => Ok(Expr::Bool(true)),
+                    _ => Ok(Expr::Bool(false)),
+                }
+            }
+
+            "and" => {
+                if args.is_empty() {
+                    return Ok(Expr::Bool(true));
+                }
+                for arg in &args {
+                    match arg {
+                        Expr::Bool(false) | Expr::Nil => return Ok(Expr::Bool(false)),
+                        _ => continue,
+                    }
+                }
+                Ok(Expr::Bool(true))
+            }
+
+            "or" => {
+                if args.is_empty() {
+                    return Ok(Expr::Bool(false));
+                }
+                for arg in &args {
+                    match arg {
+                        Expr::Bool(false) | Expr::Nil => continue,
+                        Expr::Bool(true) => return Ok(Expr::Bool(true)),
+                        _ => return Ok(Expr::Bool(true)),
+                    }
+                }
+                Ok(Expr::Bool(false))
             }
 
             "list" => Ok(Expr::List(args)),

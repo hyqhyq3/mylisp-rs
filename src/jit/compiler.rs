@@ -191,14 +191,31 @@ impl BytecodeCompiler {
 
     /// 编译变量引用
     fn compile_variable(&mut self, name: &str) -> Result<(), CompileError> {
+        // 特殊处理布尔字面量
+        if name == "true" {
+            let idx = self.chunk.add_constant(Constant::Boolean(true));
+            self.emit_instruction(Instruction::new(
+                OpCode::LoadConst,
+                vec![Operand::U32(idx as u32)],
+            ));
+            return Ok(());
+        }
+        if name == "false" {
+            let idx = self.chunk.add_constant(Constant::Boolean(false));
+            self.emit_instruction(Instruction::new(
+                OpCode::LoadConst,
+                vec![Operand::U32(idx as u32)],
+            ));
+            return Ok(());
+        }
+
         // 首先在局部变量中查找
         for (scope_idx, scope) in self.locals.iter().rev().enumerate() {
             if let Some(local) = scope.iter().find(|v| v.name == name) {
-                // depth 是作用域索引（从末尾计数）
-                let depth = scope_idx;
+                // 所有局部变量都在同一个帧中（depth=0），使用变量的 slot
                 self.emit_instruction(Instruction::new(
                     OpCode::LoadLocal,
-                    vec![Operand::U8(depth as u8), Operand::U8(local.slot as u8)],
+                    vec![Operand::U8(0), Operand::U8(local.slot as u8)],
                 ));
                 return Ok(());
             }
@@ -371,17 +388,17 @@ impl BytecodeCompiler {
                             // 编译值
                             self.compile_expr(&pair[1])?;
 
-                            // 获取当前 slot
-                            let slot = self.locals.last_mut().unwrap().len();
+                            // 计算 slot：累加所有作用域的变量数量
+                            let slot = self.locals.iter().map(|scope| scope.len()).sum::<usize>();
 
-                            // 添加局部变量
+                            // 添加局部变量到当前作用域
                             self.locals.last_mut().unwrap().push(LocalVar {
                                 name: name.clone(),
                                 depth: 0,
                                 slot,
                             });
 
-                            // 存储到局部变量（depth = 0 表示当前作用域）
+                            // 存储到局部变量（depth = 0 表示当前帧）
                             self.emit_instruction(Instruction::new(
                                 OpCode::StoreLocal,
                                 vec![Operand::U8(0), Operand::U8(slot as u8)],
@@ -439,10 +456,10 @@ impl BytecodeCompiler {
         // 首先在局部变量中查找
         for (scope_idx, scope) in self.locals.iter().rev().enumerate() {
             if let Some(local) = scope.iter().find(|v| v.name == *var_name) {
-                let depth = scope_idx;
+                // 所有局部变量都在同一个帧中（depth=0），使用变量的 slot
                 self.emit_instruction(Instruction::new(
                     OpCode::StoreLocal,
-                    vec![Operand::U8(depth as u8), Operand::U8(local.slot as u8)],
+                    vec![Operand::U8(0), Operand::U8(local.slot as u8)],
                 ));
                 return Ok(());
             }

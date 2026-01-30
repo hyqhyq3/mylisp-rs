@@ -2,7 +2,6 @@ use crate::ast::Expr;
 use crate::env::Env;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 pub struct Evaluator;
 
@@ -66,6 +65,9 @@ impl Evaluator {
                             // I/O 特殊形式 - 使用新的 SpecialForms 模块
                             "eval" => Self::eval_eval_wrapper(&list[1..], env),
                             "load" => Self::eval_load_wrapper(&list[1..], env),
+
+                            // JIT 特殊形式 - 使用字节码编译和执行
+                            "use-jit" => Self::eval_use_jit(&list[1..], env),
 
                             // 宏系统 - 保留在原处（后续拆分）
                             "define-syntax" => Self::eval_define_syntax(&list[1..], env),
@@ -211,6 +213,31 @@ impl Evaluator {
             Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
         })
         .map_err(|e| e.to_string())
+    }
+
+    /// JIT 特殊形式: 使用字节码编译和执行表达式
+    /// 语法: (use-jit expr)
+    ///
+    /// 示例:
+    ///   (use-jit (+ 1 2 3))  ; 通过 JIT 编译和执行
+    fn eval_use_jit(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 1 {
+            return Err("use-jit requires exactly 1 argument".to_string());
+        }
+
+        use crate::jit::{BytecodeCompiler, BytecodeVM};
+
+        // 1. 编译表达式为字节码
+        let mut compiler = BytecodeCompiler::new();
+        let chunk = compiler.compile(&args[0])
+            .map_err(|e| format!("JIT compilation failed: {}", e))?;
+
+        // 2. 创建并运行字节码 VM
+        let mut vm = BytecodeVM::with_env(chunk, env.clone());
+        let result = vm.run()
+            .map_err(|e| format!("JIT execution failed: {}", e))?;
+
+        Ok(result)
     }
 
     fn eval_define_lazy(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
