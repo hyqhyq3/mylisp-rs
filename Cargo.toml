@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libloading = "0.8"
+libffi = "3"
+libc = "0.2"

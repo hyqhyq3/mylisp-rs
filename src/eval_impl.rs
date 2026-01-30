@@ -651,6 +651,14 @@ impl Evaluator {
                 }
                 "newline" => crate::eval::builtins::Builtins::apply_newline()
                     .map_err(|e| e.to_string()),
+                "ffi-call" => {
+                    let mut forced = Vec::with_capacity(thunk_args.len());
+                    for arg in &thunk_args {
+                        forced.push(Self::force_deep(arg.clone())?);
+                    }
+                    crate::eval::ffi::apply_ffi_call(&forced)
+                }
+                "syscall" => crate::eval::ffi::apply_syscall(&Self::force_args(&thunk_args)?),
 
                 _ => {
                     // 不是内置函数,求值操作符并调用

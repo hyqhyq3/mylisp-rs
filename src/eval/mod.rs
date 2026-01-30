@@ -8,6 +8,7 @@ pub mod builtins;
 pub mod special_forms;
 pub mod macros;
 pub mod tco;
+pub mod ffi;
 
 // 为了向后兼容，暂时导出 error 模块的内容
 pub use error::MyLispError;
