@@ -9,3 +9,6 @@ pub mod eval_impl;
 pub mod lexer;
 pub mod parser;
 pub mod utils;
+
+// JIT 编译模块（实验性功能）
+pub mod jit;

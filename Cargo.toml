@@ -3,7 +3,27 @@ name = "mylisp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+jit = []
+
 [dependencies]
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[[bench]]
+name = "quick_bench"
+harness = false
+
+[[bench]]
+name = "flamegraph"
+harness = false
