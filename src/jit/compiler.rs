@@ -99,7 +99,7 @@ impl BytecodeCompiler {
     fn with_builtins(builtins: std::collections::HashSet<String>) -> Self {
         Self {
             chunk: Chunk::new(),
-            locals: vec![Vec::new()],
+            locals: Vec::new(), // Lambda 编译器不初始化全局作用域
             scope_depth: 0,
             globals: HashMap::new(),
             current_line: 0,
@@ -192,9 +192,10 @@ impl BytecodeCompiler {
     /// 编译变量引用
     fn compile_variable(&mut self, name: &str) -> Result<(), CompileError> {
         // 首先在局部变量中查找
-        for scope in self.locals.iter().rev() {
+        for (scope_idx, scope) in self.locals.iter().rev().enumerate() {
             if let Some(local) = scope.iter().find(|v| v.name == name) {
-                let depth = self.scope_depth - local.depth;
+                // depth 是作用域索引（从末尾计数）
+                let depth = scope_idx;
                 self.emit_instruction(Instruction::new(
                     OpCode::LoadLocal,
                     vec![Operand::U8(depth as u8), Operand::U8(local.slot as u8)],
@@ -214,12 +215,11 @@ impl BytecodeCompiler {
 
         // 检查是否是内置函数
         if self.builtins.contains(name) {
-            // 生成 LoadBuiltin 指令
-            // 内置函数索引暂时使用名称的哈希值
-            let idx = (name.len() % 256) as u32; // 简化处理
+            // 将内置函数名称作为字符串常量加载
+            let idx = self.chunk.add_constant(Constant::String(name.to_string()));
             self.emit_instruction(Instruction::new(
-                OpCode::LoadBuiltin,
-                vec![Operand::U32(idx)],
+                OpCode::LoadConst,
+                vec![Operand::U32(idx as u32)],
             ));
             return Ok(());
         }
@@ -390,10 +390,13 @@ impl BytecodeCompiler {
 
     /// 编译函数调用
     fn compile_call(&mut self, list: &[Expr]) -> Result<(), CompileError> {
-        // 编译函数和所有参数（从左到右）
-        for expr in list {
+        // 先编译所有参数（从左到右）
+        for expr in &list[1..] {
             self.compile_expr(expr)?;
         }
+
+        // 最后编译函数（这样函数会在栈顶）
+        self.compile_expr(&list[0])?;
 
         // 发起调用（参数个数 = 列表长度 - 1）
         let argc = (list.len() - 1) as u8;
@@ -448,6 +451,9 @@ impl BytecodeCompiler {
         for expr in body {
             func_compiler.compile_expr(expr)?;
         }
+
+        // 在函数体末尾添加 Return 指令
+        func_compiler.emit_instruction(Instruction::simple(OpCode::Return));
 
         func_compiler.exit_scope();
 

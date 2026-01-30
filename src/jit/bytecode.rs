@@ -324,7 +324,7 @@ impl Instruction {
 
         // 根据操作码解析操作数
         match opcode {
-            OpCode::LoadConst | OpCode::LoadGlobal | OpCode::StoreGlobal => {
+            OpCode::LoadConst | OpCode::LoadGlobal | OpCode::StoreGlobal | OpCode::MakeLambda | OpCode::LoadBuiltin => {
                 // 单个 u32 操作数
                 if *offset + 4 <= bytes.len() {
                     let mut arr = [0u8; 4];
