@@ -109,19 +109,16 @@ impl SpecialForms {
     // ========== 复杂特殊形式 ==========
 
     /// Lambda 函数: (lambda (params) body1 body2 ...)
-    pub fn eval_lambda(args: &[Expr]) -> Result<Expr, MyLispError> {
+    pub fn eval_lambda(args: &[Expr], env: &Env) -> Result<Expr, MyLispError> {
         check_min_arity(args, 2, "lambda")?;
 
         match &args[0] {
             Expr::List(params) => {
-                // lambda 表达式: (lambda (params) body1 body2 ...)
-                // 存储为: [lambda, params, body1, body2, ...]
-                let mut lambda_expr = vec![
-                    Expr::Symbol("lambda".to_string()),
-                    Expr::List(params.clone()),
-                ];
-                lambda_expr.extend_from_slice(&args[1..]);
-                Ok(Expr::List(lambda_expr))
+                Ok(Expr::Lambda {
+                    params: params.clone(),
+                    body: args[1..].to_vec(),
+                    env: env.clone(),
+                })
             }
             _ => Err(MyLispError::type_error(
                 "parameter list",
@@ -339,7 +336,8 @@ mod tests {
             Expr::List(vec![Expr::Symbol("x".to_string())]),
             Expr::Symbol("x".to_string()),
         ];
-        let result = SpecialForms::eval_lambda(&args).unwrap();
+        let env = Env::new();
+        let result = SpecialForms::eval_lambda(&args, &env).unwrap();
         match result {
             Expr::List(list) => {
                 assert_eq!(list[0], Expr::Symbol("lambda".to_string()));

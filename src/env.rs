@@ -1,10 +1,10 @@
 use crate::ast::Expr;
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Env {
-    data: HashMap<String, Expr>,
-    parent: Option<Box<Env>>,
+    pub data: HashMap<String, Expr>,
+    pub parent: Option<Box<Env>>,
 }
 
 impl Env {
@@ -44,6 +44,25 @@ impl Env {
             parent.set(key, value)
         } else {
             Err(format!("Undefined symbol: {}", key))
+        }
+    }
+
+    pub fn flatten_with_parent(&self, parent: Env) -> Env {
+        let mut data = HashMap::new();
+        let mut current = Some(self);
+
+        while let Some(env) = current {
+            for (key, value) in env.data.iter() {
+                if !data.contains_key(key) {
+                    data.insert(key.clone(), value.clone());
+                }
+            }
+            current = env.parent.as_deref();
+        }
+
+        Env {
+            data,
+            parent: Some(Box::new(parent)),
         }
     }
 }

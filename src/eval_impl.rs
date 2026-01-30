@@ -32,10 +32,16 @@ impl Evaluator {
             .map_err(|e| e.to_string())?;
 
         match expr {
-            Expr::Number(_) | Expr::Bool(_) | Expr::Nil | Expr::String(_) => Ok(expr),
+            Expr::Number(_) | Expr::Bool(_) | Expr::Nil | Expr::String(_) | Expr::Lambda { .. } => {
+                Ok(expr)
+            }
+            Expr::Thunk(_) => Self::force_expr(expr),
 
             Expr::Symbol(ref sym) => {
-                env.get(sym).ok_or_else(|| format!("Undefined symbol: {}", sym))
+                let value = env
+                    .get(sym)
+                    .ok_or_else(|| format!("Undefined symbol: {}", sym))?;
+                Self::force_expr(value)
             }
 
             Expr::List(list) => {
@@ -46,14 +52,14 @@ impl Evaluator {
                     match first {
                         Expr::Symbol(op) => match op.as_str() {
                             // 基础特殊形式 - 使用新的 SpecialForms 模块
-                            "define" => Self::eval_define_wrapper(&list[1..], env),
-                            "set!" => Self::eval_set_wrapper(&list[1..], env),
+                            "define" => Self::eval_define_lazy(&list[1..], env),
+                            "set!" => Self::eval_set_lazy(&list[1..], env),
                             "if" => Self::eval_if_wrapper(&list[1..], env, is_tail),
                             "quote" => Self::eval_quote_wrapper(&list[1..]),
 
                             // 复杂特殊形式 - 使用新的 SpecialForms 模块
-                            "lambda" | "fn" => Self::eval_lambda_wrapper(&list[1..]),
-                            "let" => Self::eval_let_wrapper(&list[1..], env, is_tail),
+                            "lambda" | "fn" => Self::eval_lambda_wrapper(&list[1..], env),
+                            "let" => Self::eval_let_lazy(&list[1..], env, is_tail),
                             "cond" => Self::eval_cond_wrapper(&list[1..], env, is_tail),
                             "begin" => Self::eval_begin_wrapper(&list[1..], env, is_tail),
 
@@ -76,6 +82,70 @@ impl Evaluator {
 
     // ========== SpecialForms 包装函数 ==========
     // 这些函数将 Evaluator::eval 转换为符合 SpecialForms API 的闭包
+
+    fn make_thunk(expr: Expr, env: &Env) -> Expr {
+        Expr::Thunk(Rc::new(RefCell::new(crate::ast::ThunkState::Unevaluated {
+            expr,
+            env: env.clone(),
+        })))
+    }
+
+    fn force_expr(expr: Expr) -> Result<Expr, String> {
+        let mut current = expr;
+        loop {
+            match current {
+                Expr::Thunk(thunk) => {
+                    let mut state = thunk.borrow_mut();
+                    match &*state {
+                        crate::ast::ThunkState::Evaluated(value) => {
+                            current = value.clone();
+                            continue;
+                        }
+                        crate::ast::ThunkState::Unevaluated { expr, env } => {
+                            let expr = expr.clone();
+                            let mut eval_env = env.clone();
+                            drop(state);
+                            let value = Self::eval_with_tail_context(expr, &mut eval_env, false)?;
+                            let value = Self::force_expr(value)?;
+                            let mut state = thunk.borrow_mut();
+                            *state = crate::ast::ThunkState::Evaluated(value.clone());
+                            current = value;
+                            continue;
+                        }
+                    }
+                }
+                _ => return Ok(current),
+            }
+        }
+    }
+
+    fn force_deep(expr: Expr) -> Result<Expr, String> {
+        let value = Self::force_expr(expr)?;
+        match value {
+            Expr::List(items) => {
+                let mut forced = Vec::with_capacity(items.len());
+                for item in items {
+                    forced.push(Self::force_deep(item)?);
+                }
+                Ok(Expr::List(forced))
+            }
+            _ => Ok(value),
+        }
+    }
+
+    fn force_args(args: &[Expr]) -> Result<Vec<Expr>, String> {
+        args.iter()
+            .map(|arg| Self::force_expr(arg.clone()))
+            .collect()
+    }
+
+    fn force_list_arg(arg: Expr, context: &str) -> Result<Expr, String> {
+        let value = Self::force_expr(arg)?;
+        match value {
+            Expr::List(_) | Expr::Nil => Ok(value),
+            _ => Err(format!("{} expects a list", context)),
+        }
+    }
 
     fn eval_define_wrapper(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
         crate::eval::special_forms::SpecialForms::eval_define(args, env, |expr, env| {
@@ -103,8 +173,8 @@ impl Evaluator {
             .map_err(|e| e.to_string())
     }
 
-    fn eval_lambda_wrapper(args: &[Expr]) -> Result<Expr, String> {
-        crate::eval::special_forms::SpecialForms::eval_lambda(args)
+    fn eval_lambda_wrapper(args: &[Expr], env: &Env) -> Result<Expr, String> {
+        crate::eval::special_forms::SpecialForms::eval_lambda(args, env)
             .map_err(|e| e.to_string())
     }
 
@@ -141,6 +211,87 @@ impl Evaluator {
             Self::eval(expr, env).map_err(|e| crate::eval::error::MyLispError::runtime(e))
         })
         .map_err(|e| e.to_string())
+    }
+
+    fn eval_define_lazy(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("define requires exactly 2 arguments".to_string());
+        }
+
+        match &args[0] {
+            Expr::Symbol(name) => {
+                let value = Self::make_thunk(args[1].clone(), env);
+                env.define(name.clone(), value);
+                Ok(Expr::Nil)
+            }
+            Expr::List(list) if !list.is_empty() => {
+                match &list[0] {
+                    Expr::Symbol(name) => {
+                        let params = list[1..].to_vec();
+                        let body = args[1].clone();
+                        let lambda = Expr::List(vec![
+                            Expr::Symbol("lambda".to_string()),
+                            Expr::List(params),
+                            body,
+                        ]);
+                        let value = Self::eval_with_tail_context(lambda, env, false)?;
+                        env.define(name.clone(), value);
+                        Ok(Expr::Nil)
+                    }
+                    _ => Err("define: function name must be a symbol".to_string()),
+                }
+            }
+            _ => Err("define: first argument must be a symbol or list".to_string()),
+        }
+    }
+
+    fn eval_set_lazy(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+        if args.len() != 2 {
+            return Err("set! requires exactly 2 arguments".to_string());
+        }
+
+        match &args[0] {
+            Expr::Symbol(name) => {
+                let value = Self::make_thunk(args[1].clone(), env);
+                env.set(name, value).map_err(|e| e.to_string())?;
+                Ok(Expr::Nil)
+            }
+            _ => Err("set!: first argument must be a symbol".to_string()),
+        }
+    }
+
+    fn eval_let_lazy(args: &[Expr], env: &mut Env, is_tail: bool) -> Result<Expr, String> {
+        if args.len() < 2 {
+            return Err("let requires at least 2 arguments".to_string());
+        }
+
+        let bindings = match &args[0] {
+            Expr::List(list) => list,
+            _ => return Err("let: first argument must be a list of bindings".to_string()),
+        };
+
+        let mut let_env = Env::with_parent(env.clone());
+        for binding in bindings {
+            match binding {
+                Expr::List(pair) if pair.len() == 2 => {
+                    let name = match &pair[0] {
+                        Expr::Symbol(sym) => sym.clone(),
+                        _ => return Err("let: binding name must be a symbol".to_string()),
+                    };
+                    let thunk = Self::make_thunk(pair[1].clone(), env);
+                    let_env.define(name, thunk);
+                }
+                _ => return Err("let: bindings must be (name value) pairs".to_string()),
+            }
+        }
+
+        let mut result = Ok(Expr::Nil);
+        for (i, expr) in args[1..].iter().enumerate() {
+            let is_last = i + 1 == args[1..].len();
+            result = Self::eval_with_tail_context(expr.clone(), &mut let_env, is_tail && is_last);
+        }
+
+        result
     }
 
     fn eval_define(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
@@ -391,82 +542,113 @@ impl Evaluator {
     }
 
     fn eval_function_call(args: Vec<Expr>, env: &mut Env, is_tail: bool) -> Result<Expr, String> {
-        // 先求值操作数(不求值操作符)
-        let evaluated_args: Result<Vec<Expr>, String> =
-            args.iter().skip(1).map(|a| Self::eval_with_tail_context(a.clone(), env, false)).collect();
-        let evaluated_args = evaluated_args?;
+        let thunk_args: Vec<Expr> = args
+            .iter()
+            .skip(1)
+            .map(|a| Self::make_thunk(a.clone(), env))
+            .collect();
 
         // 检查操作符是否是内置函数(符号)
         match &args[0] {
             Expr::Symbol(op) => match op.as_str() {
                 // 算术运算 - 使用新的 Builtins 模块
-                "+" => crate::eval::builtins::Builtins::apply_add(&evaluated_args)
+                "+" => crate::eval::builtins::Builtins::apply_add(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "-" => crate::eval::builtins::Builtins::apply_sub(&evaluated_args)
+                "-" => crate::eval::builtins::Builtins::apply_sub(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "*" => crate::eval::builtins::Builtins::apply_mul(&evaluated_args)
+                "*" => crate::eval::builtins::Builtins::apply_mul(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "/" => crate::eval::builtins::Builtins::apply_div(&evaluated_args)
+                "/" => crate::eval::builtins::Builtins::apply_div(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "mod" => crate::eval::builtins::Builtins::apply_mod(&evaluated_args)
+                "mod" => crate::eval::builtins::Builtins::apply_mod(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
 
                 // 比较运算 - 使用新的 Builtins 模块
-                ">" => crate::eval::builtins::Builtins::apply_gt(&evaluated_args)
+                ">" => crate::eval::builtins::Builtins::apply_gt(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                ">=" => crate::eval::builtins::Builtins::apply_ge(&evaluated_args)
+                ">=" => crate::eval::builtins::Builtins::apply_ge(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "<" => crate::eval::builtins::Builtins::apply_lt(&evaluated_args)
+                "<" => crate::eval::builtins::Builtins::apply_lt(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "<=" => crate::eval::builtins::Builtins::apply_le(&evaluated_args)
+                "<=" => crate::eval::builtins::Builtins::apply_le(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "=" => crate::eval::builtins::Builtins::apply_eq(&evaluated_args)
+                "=" => crate::eval::builtins::Builtins::apply_eq(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
 
                 // 逻辑运算 - and 和 or 需要保留在原处（依赖 eval）
-                "not" => crate::eval::builtins::Builtins::apply_not(&evaluated_args)
+                "not" => crate::eval::builtins::Builtins::apply_not(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "and" => Self::apply_and(&evaluated_args, env),
-                "or" => Self::apply_or(&evaluated_args, env),
+                "and" => Self::apply_and(&thunk_args),
+                "or" => Self::apply_or(&thunk_args),
 
                 // 列表操作 - 使用新的 Builtins 模块
-                "list" => crate::eval::builtins::Builtins::apply_list(&evaluated_args)
+                "list" => crate::eval::builtins::Builtins::apply_list(&thunk_args)
                     .map_err(|e| e.to_string()),
-                "head" | "car" => crate::eval::builtins::Builtins::apply_head(&evaluated_args)
-                    .map_err(|e| e.to_string()),
-                "tail" | "cdr" => crate::eval::builtins::Builtins::apply_tail(&evaluated_args)
-                    .map_err(|e| e.to_string()),
-                "cons" => crate::eval::builtins::Builtins::apply_cons(&evaluated_args)
-                    .map_err(|e| e.to_string()),
-                "append" => crate::eval::builtins::Builtins::apply_append(&evaluated_args)
-                    .map_err(|e| e.to_string()),
-                "length" => crate::eval::builtins::Builtins::apply_length(&evaluated_args)
-                    .map_err(|e| e.to_string()),
-                "reverse" => crate::eval::builtins::Builtins::apply_reverse(&evaluated_args)
-                    .map_err(|e| e.to_string()),
+                "head" | "car" => {
+                    let list_arg = Self::force_list_arg(thunk_args[0].clone(), "head")?;
+                    crate::eval::builtins::Builtins::apply_head(&[list_arg])
+                        .map_err(|e| e.to_string())
+                }
+                "tail" | "cdr" => {
+                    let list_arg = Self::force_list_arg(thunk_args[0].clone(), "tail")?;
+                    crate::eval::builtins::Builtins::apply_tail(&[list_arg])
+                        .map_err(|e| e.to_string())
+                }
+                "cons" => {
+                    let list_arg = Self::force_list_arg(thunk_args[1].clone(), "cons")?;
+                    crate::eval::builtins::Builtins::apply_cons(&[
+                        thunk_args[0].clone(),
+                        list_arg,
+                    ])
+                    .map_err(|e| e.to_string())
+                }
+                "append" => {
+                    let mut forced = Vec::with_capacity(thunk_args.len());
+                    for arg in &thunk_args {
+                        forced.push(Self::force_list_arg(arg.clone(), "append")?);
+                    }
+                    crate::eval::builtins::Builtins::apply_append(&forced)
+                        .map_err(|e| e.to_string())
+                }
+                "length" => {
+                    let list_arg = Self::force_list_arg(thunk_args[0].clone(), "length")?;
+                    crate::eval::builtins::Builtins::apply_length(&[list_arg])
+                        .map_err(|e| e.to_string())
+                }
+                "reverse" => {
+                    let list_arg = Self::force_list_arg(thunk_args[0].clone(), "reverse")?;
+                    crate::eval::builtins::Builtins::apply_reverse(&[list_arg])
+                        .map_err(|e| e.to_string())
+                }
 
                 // 谓词函数 - 使用新的 Builtins 模块
-                "eq?" => crate::eval::builtins::Builtins::apply_eq(&evaluated_args)
+                "eq?" => crate::eval::builtins::Builtins::apply_eq(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "null?" => crate::eval::builtins::Builtins::apply_null(&evaluated_args)
+                "null?" => crate::eval::builtins::Builtins::apply_null(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "symbol?" => crate::eval::builtins::Builtins::apply_symbol_predicate(&evaluated_args)
+                "symbol?" => crate::eval::builtins::Builtins::apply_symbol_predicate(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "list?" => crate::eval::builtins::Builtins::apply_list_predicate(&evaluated_args)
+                "list?" => crate::eval::builtins::Builtins::apply_list_predicate(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "number?" => crate::eval::builtins::Builtins::apply_number_predicate(&evaluated_args)
+                "number?" => crate::eval::builtins::Builtins::apply_number_predicate(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
-                "string?" => crate::eval::builtins::Builtins::apply_string_predicate(&evaluated_args)
+                "string?" => crate::eval::builtins::Builtins::apply_string_predicate(&Self::force_args(&thunk_args)?)
                     .map_err(|e| e.to_string()),
 
                 // 高阶函数 - 保留在原处（依赖 eval）
-                "map" => Self::apply_map(&evaluated_args, env),
-                "filter" => Self::apply_filter(&evaluated_args, env),
-                "fold" => Self::apply_fold(&evaluated_args, env),
+                "map" => Self::apply_map(&thunk_args, env),
+                "filter" => Self::apply_filter(&thunk_args, env),
+                "fold" => Self::apply_fold(&thunk_args, env),
 
                 // I/O 操作 - 使用新的 Builtins 模块
-                "display" => crate::eval::builtins::Builtins::apply_display(&evaluated_args)
-                    .map_err(|e| e.to_string()),
+                "display" => {
+                    let mut forced = Vec::with_capacity(thunk_args.len());
+                    for arg in &thunk_args {
+                        forced.push(Self::force_deep(arg.clone())?);
+                    }
+                    crate::eval::builtins::Builtins::apply_display(&forced)
+                        .map_err(|e| e.to_string())
+                }
                 "newline" => crate::eval::builtins::Builtins::apply_newline()
                     .map_err(|e| e.to_string()),
 
@@ -474,154 +656,88 @@ impl Evaluator {
                     // 不是内置函数,求值操作符并调用
                     let func = Self::eval_with_tail_context(args[0].clone(), env, false)?;
                     if is_tail {
-                        if let Expr::List(ref list) = func {
-                            if !list.is_empty()
-                                && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
-                            {
-                                // 尾调用优化
-                                return Self::apply_user_function_tail(func, evaluated_args, env);
+                        let is_lambda = match &func {
+                            Expr::Lambda { .. } => true,
+                            Expr::List(list) => {
+                                !list.is_empty()
+                                    && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
                             }
+                            _ => false,
+                        };
+                        if is_lambda {
+                            // 尾调用优化
+                            return Self::apply_user_function_tail(func, thunk_args, env);
                         }
                     }
-                    Self::apply_user_function(func, evaluated_args, env)
+                    Self::apply_user_function(func, thunk_args, env)
                 }
             },
             _ => {
                 // 操作符不是符号,求值并调用
                 let func = Self::eval_with_tail_context(args[0].clone(), env, false)?;
                 if is_tail {
-                    if let Expr::List(ref list) = func {
-                        if !list.is_empty()
-                            && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
-                        {
-                            return Self::apply_user_function_tail(func, evaluated_args, env);
+                    let is_lambda = match &func {
+                        Expr::Lambda { .. } => true,
+                        Expr::List(list) => {
+                            !list.is_empty()
+                                && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
                         }
+                        _ => false,
+                    };
+                    if is_lambda {
+                        return Self::apply_user_function_tail(func, thunk_args, env);
                     }
                 }
-                Self::apply_user_function(func, evaluated_args, env)
+                Self::apply_user_function(func, thunk_args, env)
             }
         }
     }
 
-    // 尾调用优化版本的函数应用:使用循环代替递归
+    // 尾调用优化版本的函数应用:使用 Trampoline 模式
     fn apply_user_function_tail(func: Expr, args: Vec<Expr>, env: &mut Env) -> Result<Expr, String> {
-        let mut current_func = func;
-        let mut current_args = args;
-        let mut current_env = env.clone();
+        // 创建初始 Thunk（携带环境快照）
+        let env_snapshot = match &func {
+            Expr::Lambda { env: func_env, .. } => func_env.clone(),
+            _ => env.clone(),
+        };
+        let thunk = crate::eval::tco::Thunk::TailCall {
+            func,
+            args,
+            env_snapshot,
+        };
 
-        loop {
-            // 提取 lambda 信息
-            let (params, body_exprs) = match &current_func {
-                Expr::List(list) if !list.is_empty() => {
-                    match &list[0] {
-                        Expr::Symbol(s) if s == "lambda" || s == "fn" => {
-                            match &list[1] {
-                                Expr::List(params) => (params.clone(), list[2..].to_vec()),
-                                _ => return Err("Invalid lambda parameter list".to_string()),
-                            }
-                        }
-                        _ => return Err("Cannot call non-function".to_string()),
-                    }
-                }
-                _ => return Err("Cannot call non-function".to_string()),
-            };
-
-            // 检查参数数量
-            if params.len() != current_args.len() {
-                return Err(format!(
-                    "Arity mismatch: expected {}, got {}",
-                    params.len(),
-                    current_args.len()
-                ));
-            }
-
-            // 创建新环境
-            let mut func_env = Env::with_parent(current_env);
-
-            // 绑定参数
-            for (param, arg) in params.iter().zip(current_args.iter()) {
-                match param {
-                    Expr::Symbol(name) => {
-                        func_env.define(name.clone(), arg.clone());
-                    }
-                    _ => {}
-                }
-            }
-
-            // 按顺序求值 body
-            let mut result = Ok(Expr::Nil);
-            let mut next_tail_call = None;
-
-            for (i, expr) in body_exprs.iter().enumerate() {
-                let is_last = i == body_exprs.len() - 1;
-
-                if is_last {
-                    // 最后一个表达式:检查是否是尾调用
-                    match expr {
-                        Expr::List(call_list) if !call_list.is_empty() => {
-                            // 求值操作符
-                            let func = Self::eval_with_tail_context(
-                                call_list[0].clone(),
-                                &mut func_env,
-                                false
-                            )?;
-
-                            // 求值参数
-                            let evaluated_args: Result<Vec<Expr>, String> = call_list[1..]
-                                .iter()
-                                .map(|a| Self::eval_with_tail_context(a.clone(), &mut func_env, false))
-                                .collect();
-                            let evaluated_args = evaluated_args?;
-
-                            // 检查是否是尾调用 lambda
-                            match func {
-                                Expr::List(ref inner_list) if !inner_list.is_empty() => {
-                                    match &inner_list[0] {
-                                        Expr::Symbol(s) if s == "lambda" || s == "fn" => {
-                                            // 尾调用:保存信息并继续循环
-                                            next_tail_call = Some((func, evaluated_args, func_env));
-                                            break;
-                                        }
-                                        _ => {
-                                            // 不是 lambda,正常求值并返回
-                                            result = Self::apply_user_function(func, evaluated_args, &mut func_env);
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // 不是列表,正常求值并返回
-                                    result = Self::apply_user_function(func, evaluated_args, &mut func_env);
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {
-                            // 最后一个表达式不是函数调用
-                            result = Self::eval_with_tail_context(expr.clone(), &mut func_env, true);
-                        }
-                    }
-                } else {
-                    // 不是最后一个表达式
-                    result = Self::eval_with_tail_context(expr.clone(), &mut func_env, false);
-                }
-            }
-
-            // 如果有尾调用,继续循环
-            if let Some((func, args, new_env)) = next_tail_call {
-                current_func = func;
-                current_args = args;
-                current_env = new_env;
-                continue;
-            }
-
-            // 没有尾调用,返回结果
-            return result;
-        }
+        // 执行 trampoline 循环，传入基础环境和求值函数
+        thunk.trampoline(env, |expr, env| {
+            Self::eval(expr, env)
+        })
     }
 
     fn apply_user_function(func: Expr, args: Vec<Expr>, env: &mut Env) -> Result<Expr, String> {
         match func {
+            Expr::Lambda { params, body, env: func_env } => {
+                if params.len() != args.len() {
+                    return Err(format!(
+                        "Arity mismatch: expected {}, got {}",
+                        params.len(),
+                        args.len()
+                    ));
+                }
+
+                let merged_env = func_env.flatten_with_parent(env.clone());
+                let mut call_env = Env::with_parent(merged_env);
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    if let Expr::Symbol(name) = param {
+                        call_env.define(name.clone(), arg.clone());
+                    }
+                }
+
+                let mut result = Ok(Expr::Nil);
+                for (i, expr) in body.iter().enumerate() {
+                    let is_last = i + 1 == body.len();
+                    result = Self::eval_with_tail_context(expr.clone(), &mut call_env, is_last);
+                }
+                result
+            }
             Expr::List(list) => {
                 if list.len() >= 3
                     && matches!(&list[0], Expr::Symbol(s) if s == "lambda" || s == "fn")
@@ -648,8 +764,9 @@ impl Evaluator {
                             }
 
                             let mut result = Ok(Expr::Nil);
-                            for expr in &list[2..] {
-                                result = Self::eval(expr.clone(), &mut func_env);
+                            for (i, expr) in list[2..].iter().enumerate() {
+                                let is_last = i + 1 == list[2..].len();
+                                result = Self::eval_with_tail_context(expr.clone(), &mut func_env, is_last);
                             }
                             result
                         }
@@ -828,21 +945,20 @@ impl Evaluator {
         Ok(Expr::Bool(result))
     }
 
-    fn apply_and(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+    fn apply_and(args: &[Expr]) -> Result<Expr, String> {
         for arg in args {
-            let result = Self::eval(arg.clone(), env)?;
+            let result = Self::force_expr(arg.clone())?;
             match result {
-                Expr::Bool(false) => return Ok(Expr::Bool(false)),
-                Expr::Nil => return Ok(Expr::Bool(false)),
+                Expr::Bool(false) | Expr::Nil => return Ok(Expr::Bool(false)),
                 _ => continue,
             }
         }
         Ok(Expr::Bool(true))
     }
 
-    fn apply_or(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+    fn apply_or(args: &[Expr]) -> Result<Expr, String> {
         for arg in args {
-            let result = Self::eval(arg.clone(), env)?;
+            let result = Self::force_expr(arg.clone())?;
             match result {
                 Expr::Bool(true) => return Ok(Expr::Bool(true)),
                 Expr::Nil => continue,
@@ -1037,9 +1153,11 @@ impl Evaluator {
             return Err("map requires exactly 2 arguments".to_string());
         }
 
-        let func = &args[0];
-        let list = match &args[1] {
+        let func = Self::force_expr(args[0].clone())?;
+        let list_value = Self::force_list_arg(args[1].clone(), "map")?;
+        let list = match list_value {
             Expr::List(l) => l,
+            Expr::Nil => Vec::new(),
             _ => return Err("map: second argument must be a list".to_string()),
         };
 
@@ -1058,9 +1176,11 @@ impl Evaluator {
             return Err("filter requires exactly 2 arguments".to_string());
         }
 
-        let func = &args[0];
-        let list = match &args[1] {
+        let func = Self::force_expr(args[0].clone())?;
+        let list_value = Self::force_list_arg(args[1].clone(), "filter")?;
+        let list = match list_value {
             Expr::List(l) => l,
+            Expr::Nil => Vec::new(),
             _ => return Err("filter: second argument must be a list".to_string()),
         };
 
@@ -1088,10 +1208,12 @@ impl Evaluator {
             return Err("fold requires exactly 3 arguments".to_string());
         }
 
-        let func = &args[0];
-        let initial = &args[1];
-        let list = match &args[2] {
+        let func = Self::force_expr(args[0].clone())?;
+        let initial = args[1].clone();
+        let list_value = Self::force_list_arg(args[2].clone(), "fold")?;
+        let list = match list_value {
             Expr::List(l) => l,
+            Expr::Nil => Vec::new(),
             _ => return Err("fold: third argument must be a list".to_string()),
         };
 

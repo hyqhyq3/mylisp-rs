@@ -5,6 +5,7 @@
 pub mod ast;
 pub mod env;
 pub mod eval;
+pub mod eval_impl;
 pub mod lexer;
 pub mod parser;
 pub mod utils;

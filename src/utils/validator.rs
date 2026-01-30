@@ -132,6 +132,8 @@ pub fn get_type_name(expr: &Expr) -> String {
         Expr::String(_) => "string".to_string(),
         Expr::Bool(_) => "boolean".to_string(),
         Expr::List(_) => "list".to_string(),
+        Expr::Thunk(_) => "thunk".to_string(),
+        Expr::Lambda { .. } => "function".to_string(),
         Expr::Nil => "nil".to_string(),
     }
 }
