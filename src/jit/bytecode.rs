@@ -411,6 +411,9 @@ pub struct Chunk {
 
     /// 调试信息（行号等）
     pub debug_info: DebugInfo,
+
+    /// 全局变量名称列表（索引 -> 名称）
+    pub global_names: Vec<String>,
 }
 
 /// 常量值
@@ -445,6 +448,7 @@ impl Chunk {
             code: Vec::new(),
             constants: Vec::new(),
             debug_info: DebugInfo { lines: Vec::new() },
+            global_names: Vec::new(),
         }
     }
 

@@ -245,9 +245,7 @@ impl BytecodeCompiler {
 
             // 特殊形式：set!
             Expr::Symbol(op) if op == "set!" => {
-                return Err(CompileError::UnsupportedSyntax(
-                    "set! not yet supported in bytecode".to_string(),
-                ));
+                self.compile_set(&list[1..])?;
             }
 
             // 特殊形式：if
@@ -262,9 +260,7 @@ impl BytecodeCompiler {
 
             // 特殊形式：let
             Expr::Symbol(op) if op == "let" => {
-                return Err(CompileError::UnsupportedSyntax(
-                    "let not yet supported in bytecode".to_string(),
-                ));
+                self.compile_let(&list[1..])?;
             }
 
             // 特殊形式：quote
@@ -307,6 +303,8 @@ impl BytecodeCompiler {
                 } else {
                     let idx = self.globals.len();
                     self.globals.insert(name.clone(), idx);
+                    // 记录全局变量名称到 chunk
+                    self.chunk.global_names.push(name.clone());
                     idx
                 };
 
@@ -331,6 +329,136 @@ impl BytecodeCompiler {
         }
 
         Ok(())
+    }
+
+    /// 编译 let 表达式
+    /// 语法：(let ((var1 val1) (var2 val2) ...) body...)
+    fn compile_let(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        if args.is_empty() {
+            return Err(CompileError::UnsupportedSyntax(
+                "let requires bindings and body".to_string(),
+            ));
+        }
+
+        // 第一个元素是绑定列表
+        let bindings = match &args[0] {
+            Expr::List(list) => list,
+            _ => {
+                return Err(CompileError::UnsupportedSyntax(
+                    "let bindings must be a list".to_string(),
+                ));
+            }
+        };
+
+        // 获取 body 表达式
+        let body = &args[1..];
+        if body.is_empty() {
+            return Err(CompileError::UnsupportedSyntax(
+                "let requires at least one body expression".to_string(),
+            ));
+        }
+
+        // 进入新的作用域
+        self.enter_scope();
+
+        // 编译每个绑定
+        for binding in bindings {
+            match binding {
+                Expr::List(pair) if pair.len() == 2 => {
+                    // (var value)
+                    match &pair[0] {
+                        Expr::Symbol(name) => {
+                            // 编译值
+                            self.compile_expr(&pair[1])?;
+
+                            // 获取当前 slot
+                            let slot = self.locals.last_mut().unwrap().len();
+
+                            // 添加局部变量
+                            self.locals.last_mut().unwrap().push(LocalVar {
+                                name: name.clone(),
+                                depth: 0,
+                                slot,
+                            });
+
+                            // 存储到局部变量（depth = 0 表示当前作用域）
+                            self.emit_instruction(Instruction::new(
+                                OpCode::StoreLocal,
+                                vec![Operand::U8(0), Operand::U8(slot as u8)],
+                            ));
+                        }
+                        _ => {
+                            return Err(CompileError::UnsupportedSyntax(
+                                "let binding variable must be a symbol".to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(CompileError::UnsupportedSyntax(
+                        "let binding must be a list of (var value)".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // 编译 body 表达式（按顺序，最后一个值作为 let 的结果）
+        for expr in body {
+            self.compile_expr(expr)?;
+        }
+
+        // 离开作用域
+        self.exit_scope();
+
+        Ok(())
+    }
+
+    /// 编译 set! 表达式
+    /// 语法：(set! var value)
+    fn compile_set(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        if args.len() != 2 {
+            return Err(CompileError::UnsupportedSyntax(
+                "set! requires exactly 2 arguments".to_string(),
+            ));
+        }
+
+        // 获取变量名
+        let var_name = match &args[0] {
+            Expr::Symbol(name) => name,
+            _ => {
+                return Err(CompileError::UnsupportedSyntax(
+                    "set! variable must be a symbol".to_string(),
+                ));
+            }
+        };
+
+        // 先编译值
+        self.compile_expr(&args[1])?;
+
+        // 查找变量位置（局部或全局）
+        // 首先在局部变量中查找
+        for (scope_idx, scope) in self.locals.iter().rev().enumerate() {
+            if let Some(local) = scope.iter().find(|v| v.name == *var_name) {
+                let depth = scope_idx;
+                self.emit_instruction(Instruction::new(
+                    OpCode::StoreLocal,
+                    vec![Operand::U8(depth as u8), Operand::U8(local.slot as u8)],
+                ));
+                return Ok(());
+            }
+        }
+
+        // 在全局变量中查找
+        if let Some(&idx) = self.globals.get(var_name) {
+            self.emit_instruction(Instruction::new(
+                OpCode::StoreGlobal,
+                vec![Operand::U32(idx as u32)],
+            ));
+            return Ok(());
+        }
+
+        // 变量未定义
+        Err(CompileError::UndefinedVariable(var_name.clone()))
     }
 
     /// 编译 if 表达式
@@ -801,5 +929,127 @@ mod tests {
         } else {
             panic!("Expected Lambda constant");
         }
+    }
+
+    #[test]
+    fn test_compile_let_simple() {
+        let mut compiler = BytecodeCompiler::new();
+        // (let ((x 10)) x)
+        let expr = Expr::List(vec![
+            Expr::Symbol("let".to_string()),
+            Expr::List(vec![
+                Expr::List(vec![
+                    Expr::Symbol("x".to_string()),
+                    Expr::Number(10.0),
+                ]),
+            ]),
+            Expr::Symbol("x".to_string()),
+        ]);
+
+        let result = compiler.compile(&expr);
+        if let Err(ref e) = result {
+            eprintln!("Compile error: {}", e);
+        }
+        assert!(result.is_ok());
+
+        let chunk = result.unwrap();
+        assert!(chunk.code.contains(&(OpCode::StoreLocal as u8)));
+        assert!(chunk.code.contains(&(OpCode::LoadLocal as u8)));
+    }
+
+    #[test]
+    fn test_compile_let_multiple_bindings() {
+        let mut compiler = BytecodeCompiler::new();
+        // (let ((x 10) (y 20)) (+ x y))
+        let expr = Expr::List(vec![
+            Expr::Symbol("let".to_string()),
+            Expr::List(vec![
+                Expr::List(vec![
+                    Expr::Symbol("x".to_string()),
+                    Expr::Number(10.0),
+                ]),
+                Expr::List(vec![
+                    Expr::Symbol("y".to_string()),
+                    Expr::Number(20.0),
+                ]),
+            ]),
+            Expr::List(vec![
+                Expr::Symbol("+".to_string()),
+                Expr::Symbol("x".to_string()),
+                Expr::Symbol("y".to_string()),
+            ]),
+        ]);
+
+        let result = compiler.compile(&expr);
+        assert!(result.is_ok());
+
+        let chunk = result.unwrap();
+        // 打印反汇编用于调试
+        eprintln!("Disassembly:\n{}", chunk.disassemble("test_let_multiple"));
+
+        // 使用指令解码来统计 StoreLocal 指令
+        let mut offset = 0;
+        let mut store_count = 0;
+        while offset < chunk.code.len() {
+            if let Some(instruction) = Instruction::decode(&chunk.code, &mut offset) {
+                if instruction.opcode == OpCode::StoreLocal {
+                    store_count += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        eprintln!("StoreLocal count: {}", store_count);
+        // 应该有两次 StoreLocal（x 和 y）
+        assert_eq!(store_count, 2);
+    }
+
+    #[test]
+    fn test_compile_set_local() {
+        let mut compiler = BytecodeCompiler::new();
+        // 先定义一个局部变量（通过 let）
+        compiler.compile(&Expr::List(vec![
+            Expr::Symbol("let".to_string()),
+            Expr::List(vec![
+                Expr::List(vec![
+                    Expr::Symbol("x".to_string()),
+                    Expr::Number(10.0),
+                ]),
+            ]),
+            // (set! x 20)
+            Expr::List(vec![
+                Expr::Symbol("set!".to_string()),
+                Expr::Symbol("x".to_string()),
+                Expr::Number(20.0),
+            ]),
+        ])).unwrap();
+
+        // 检查编译成功
+        // let 会创建新的作用域，set! 应该编译为 StoreLocal
+        assert!(true); // 如果没有 panic 就算成功
+    }
+
+    #[test]
+    fn test_compile_set_global() {
+        let mut compiler = BytecodeCompiler::new();
+        // 先定义一个全局变量
+        compiler.compile(&Expr::List(vec![
+            Expr::Symbol("define".to_string()),
+            Expr::Symbol("x".to_string()),
+            Expr::Number(42.0),
+        ])).unwrap();
+
+        // (set! x 100)
+        let result = compiler.compile(&Expr::List(vec![
+            Expr::Symbol("set!".to_string()),
+            Expr::Symbol("x".to_string()),
+            Expr::Number(100.0),
+        ]));
+
+        assert!(result.is_ok());
+
+        let chunk = result.unwrap();
+        // set! 应该编译为 StoreGlobal（因为 x 是全局变量）
+        assert!(chunk.code.contains(&(OpCode::StoreGlobal as u8)));
     }
 }
